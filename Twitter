@@ -1,0 +1,287 @@
+const express = require('express')
+const jwt = require('jsonwebtoken')
+const bcrypt = require('bcrypt')
+const sqlite3 = require('sqlite3').verbose()
+const bodyParser = require('body-parser')
+
+const app = express()
+const PORT = 3000
+const JWT_SECRET =
+  'aad05253bb7a7a6991f9175f0a23045f0af4c9ed48aab88c93fe89eb8e98a524' // Change this to a secure secret key
+
+// Middleware
+app.use(bodyParser.json())
+
+// SQLite Database Connection
+const db = new sqlite3.Database('./twitterClone.db')
+
+// Middleware for JWT authentication
+const authenticateJWT = (req, res, next) => {
+  const authHeader = req.headers['authorization']
+
+  // Ensure the Authorization header is present and starts with 'Bearer '
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).send('Invalid JWT Token')
+  }
+
+  // Extract the token part (after 'Bearer ')
+  const token = authHeader.split(' ')[1]
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(401).send('Invalid JWT Token')
+    }
+    req.user = user
+    next()
+  })
+}
+
+// API 1: User Registration
+app.post('/register/', (req, res) => {
+  const {username, password, name, gender} = req.body
+
+  // Validate password length
+  if (password.length < 6) {
+    return res.status(400).send('Password is too short')
+  }
+
+  // Check if the user with the given username already exists
+  db.get('SELECT * FROM user WHERE username = ?', [username], (err, row) => {
+    if (err) {
+      return res.status(500).send({message: 'Database error'})
+    }
+
+    if (row) {
+      // If user exists, return 'User already exists' message
+      return res.status(400).send('User already exists')
+    }
+
+    // Proceed to create the user if they do not exist
+    bcrypt.hash(password, 10, (err, hashedPassword) => {
+      if (err) {
+        return res.status(500).send('Error hashing password')
+      }
+
+      // Insert new user into the database
+      db.run(
+        'INSERT INTO user (name, username, password, gender) VALUES (?, ?, ?, ?)',
+        [name, username, hashedPassword, gender],
+        function (err) {
+          if (err) {
+            return res.status(500).send('Error creating user')
+          }
+          res.status(200).send('User created successfully')
+        },
+      )
+    })
+  })
+})
+
+// API 2: User Login
+app.post('/login/', (req, res) => {
+  const {username, password} = req.body
+
+  db.get('SELECT * FROM user WHERE username = ?', [username], (err, row) => {
+    if (!row) {
+      return res.status(400).send('Invalid user')
+    }
+
+    bcrypt.compare(password, row.password, (err, isMatch) => {
+      if (!isMatch) {
+        return res.status(400).send('Invalid password')
+      }
+
+      const token = jwt.sign({userId: row.user_id}, JWT_SECRET, {
+        expiresIn: '1h',
+      })
+      res.json({jwtToken: token})
+    })
+  })
+})
+
+// API 3: Get User's Tweet Feed
+app.get('/user/tweets/feed/', authenticateJWT, (req, res) => {
+  const userId = req.user.userId
+  const query = `
+        SELECT user.username,tweet.tweet,tweet.date_time
+        FROM tweet
+        JOIN user ON tweet.user_id = user.user_id
+        JOIN follower ON follower.following_user_id = user.user_id
+        WHERE follower.follower_user_id = ?
+        ORDER BY tweet.date_time DESC
+        LIMIT 4
+    `
+
+  db.all(query, [userId], (err, tweets) => {
+    if (tweets) {
+      return res.status(200).json({tweets})
+    }
+    res.query
+    //res.status(401).send('Invalid JWT Token')
+  })
+})
+
+// API 4: Get Following Users
+app.get('/user/following/', authenticateJWT, (req, res) => {
+  const userId = req.user.userId
+  db.all(
+    'SELECT user.username FROM follower JOIN user ON follower.following_user_id = user.user_id WHERE follower.follower_user_id = ?',
+    [userId],
+    (err, following) => {
+      if (err) {
+        return res.status(401).send('Invalid JWT Token')
+      }
+      res.json(following)
+    },
+  )
+})
+
+// API 5: Get Followers
+app.get('/user/followers/', authenticateJWT, (req, res) => {
+  const userId = req.user.userId
+  db.all(
+    'SELECT user.username FROM follower JOIN user ON follower.follower_user_id = user.user_id WHERE follower.following_user_id = ?',
+    [userId],
+    (err, followers) => {
+      if (err) {
+        return res.status(401).send('Invalid JWT Token')
+      }
+      res.json(followers)
+    },
+  )
+})
+
+// API 6: Get Tweet by ID
+app.get('/tweets/:tweetId/', authenticateJWT, (req, res) => {
+  const tweetId = req.params.tweetId
+  const userId = req.user.userId
+
+  const query = `
+        SELECT tweet.*, COUNT(like.user_id) as likes, COUNT(r.reply_id) as replies 
+        FROM tweet 
+        LEFT JOIN like ON tweet.tweet_id = like.tweet_id 
+        LEFT JOIN reply r ON tweet.tweet_id = r.tweet_id 
+        WHERE tweet.tweet_id = ? AND tweet.user_id IN (
+            SELECT following_user_id FROM follower WHERE follower_user_id = ?
+        )
+        GROUP BY tweet.tweet_id
+    `
+
+  db.get(query, [tweetId, userId], (err, tweet) => {
+    if (!tweet) {
+      return res.status(401).send('Invalid Request')
+    }
+    res.json(tweet)
+  })
+})
+
+// API 7: Get Likes of a Tweet
+app.get('/tweets/:tweetId/likes/', authenticateJWT, (req, res) => {
+  const tweetId = req.params.tweetId
+  const userId = req.user.userId
+
+  const checkQuery = `SELECT * FROM tweet WHERE tweet_id = ? AND user_id IN (
+        SELECT following_user_id FROM follower WHERE follower_user_id = ?
+    )`
+
+  db.get(checkQuery, [tweetId, userId], (err, row) => {
+    if (!row) {
+      return res.status(401).send('Invalid Request')
+    }
+
+    db.all(
+      'SELECT user.username FROM like JOIN user ON like.user_id = user.user_id WHERE like.tweet_id = ?',
+      [tweetId],
+      (err, likes) => {
+        if (err) {
+          return res.status(500).send('Invalid Request')
+        }
+        res.json({likes: likes.map(like => like.username)})
+      },
+    )
+  })
+})
+
+// API 8: Get Replies of a Tweet
+app.get('/tweets/:tweetId/replies/', authenticateJWT, (req, res) => {
+  const tweetId = req.params.tweetId
+  const userId = req.user.userId
+
+  const checkQuery = `SELECT * FROM tweet WHERE tweet_id = ? AND user_id IN (
+        SELECT following_user_id FROM follower WHERE follower_user_id = ?
+    )`
+
+  db.get(checkQuery, [tweetId, userId], (err, row) => {
+    if (!row) {
+      return res.status(401).send('Invalid Request')
+    }
+
+    db.all(
+      'SELECT reply.reply, user.username FROM reply JOIN user ON reply.user_id = user.user_id WHERE reply.tweet_id = ?',
+      [tweetId],
+      (err, replies) => {
+        if (err) {
+          return res.status(500).send('Invalid Request')
+        }
+        res.json(replies)
+      },
+    )
+  })
+})
+
+// API 9: Get All Tweets by User
+app.get('/user/tweets/', authenticateJWT, (req, res) => {
+  const userId = req.user.userId
+  db.all('SELECT * FROM tweet WHERE user_id = ?', [userId], (err, tweets) => {
+    if (err) {
+      return res.status(401).send('Invalid JWT Token')
+    }
+    res.json(tweets)
+  })
+})
+
+// API 10: Create a Tweet
+app.post('/user/tweets/', authenticateJWT, (req, res) => {
+  const {tweet} = req.body
+  const userId = req.user.userId
+
+  db.run(
+    'INSERT INTO tweet (tweet, user_id, date_time) VALUES (?, ?, ?)',
+    [tweet, userId, new Date()],
+    function (err) {
+      if (err) {
+        return res.status(401).send('Invalid JWT Token')
+      }
+      res.status(201).send('Created a Tweet')
+    },
+  )
+})
+
+// API 11: Delete a Tweet
+app.delete('/tweets/:tweetId/', authenticateJWT, (req, res) => {
+  const tweetId = req.params.tweetId
+  const userId = req.user.userId
+
+  db.get(
+    'SELECT * FROM tweet WHERE tweet_id = ? AND user_id = ?',
+    [tweetId, userId],
+    (err, row) => {
+      if (!row) {
+        return res.status(401).send('Invalid Request')
+      }
+
+      db.run('DELETE FROM tweet WHERE tweet_id = ?', [tweetId], function (err) {
+        if (err) {
+          return res.status(401).send('Invalid Request')
+        }
+        res.send('Tweet Removed')
+      })
+    },
+  )
+})
+
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`)
+})
+
+module.exports = app // Export the express instance
